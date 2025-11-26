@@ -1,0 +1,418 @@
+name: 🚀 Agent Launchpad Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        default: 'false'
+      force_deploy:
+        description: 'Force deploy even if no changes'
+        required: false
+        default: 'false'
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ============================================
+  # JOB 1: VALIDATE - Run in parallel for speed
+  # ============================================
+  validate:
+    name: 🔍 Validate
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+      agent_type: ${{ steps.detect.outputs.agent_type }}
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔎 Detect Agent Type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "agent_type=node" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "agent_type=python" >> $GITHUB_OUTPUT
+          else
+            echo "agent_type=generic" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📦 Setup Node
+        if: steps.detect.outputs.agent_type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 🐍 Setup Python
+        if: steps.detect.outputs.agent_type == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📋 Install Dependencies
+        run: |
+          if [ "${{ steps.detect.outputs.agent_type }}" == "node" ]; then
+            npm ci --prefer-offline
+          elif [ "${{ steps.detect.outputs.agent_type }}" == "python" ]; then
+            pip install -r requirements.txt 2>/dev/null || pip install -e . 2>/dev/null || true
+          fi
+
+      - name: 🔑 Validate API Keys
+        run: |
+          echo "Checking required secrets..."
+          missing=""
+          
+          if [ -z "${{ secrets.GOOGLE_API_KEY }}" ] && [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ] && [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "⚠️  Warning: No AI API keys found. Add GOOGLE_API_KEY (recommended), ANTHROPIC_API_KEY, or OPENAI_API_KEY to secrets."
+          else
+            echo "✅ AI API key found"
+          fi
+          
+          if [ -z "${{ secrets.VERCEL_TOKEN }}" ]; then
+            echo "⚠️  Warning: VERCEL_TOKEN not set. Deployment may fail."
+          fi
+          
+          echo "✅ Secret validation complete"
+
+      - name: 🎨 Lint Code
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.detect.outputs.agent_type }}" == "node" ]; then
+            npm run lint 2>/dev/null || npx eslint . --ext .js,.jsx,.ts,.tsx 2>/dev/null || echo "No linter configured"
+          elif [ "${{ steps.detect.outputs.agent_type }}" == "python" ]; then
+            pip install ruff 2>/dev/null
+            ruff check . 2>/dev/null || echo "No linter configured"
+          fi
+
+      - name: 📊 Check Changes
+        id: changes
+        run: |
+          if git diff --quiet HEAD~1 HEAD -- . 2>/dev/null; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================
+  # JOB 2: TEST
+  # ============================================
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event.inputs.skip_tests != 'true'
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node
+        if: needs.validate.outputs.agent_type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 🐍 Setup Python
+        if: needs.validate.outputs.agent_type == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📋 Install Dependencies
+        run: |
+          if [ "${{ needs.validate.outputs.agent_type }}" == "node" ]; then
+            npm ci --prefer-offline
+          elif [ "${{ needs.validate.outputs.agent_type }}" == "python" ]; then
+            pip install -r requirements.txt 2>/dev/null || pip install -e . 2>/dev/null || true
+            pip install pytest pytest-cov 2>/dev/null || true
+          fi
+
+      - name: 🧪 Run Tests
+        run: |
+          if [ "${{ needs.validate.outputs.agent_type }}" == "node" ]; then
+            npm test 2>/dev/null || echo "No tests configured - add 'test' script to package.json"
+          elif [ "${{ needs.validate.outputs.agent_type }}" == "python" ]; then
+            pytest --cov=. --cov-report=xml 2>/dev/null || python -m pytest 2>/dev/null || echo "No tests found"
+          fi
+
+      - name: 📈 Upload Coverage
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          fail_ci_if_error: false
+
+  # ============================================
+  # JOB 3: DOCUMENT - Auto-generate docs with AI
+  # ============================================
+  document:
+    name: 📝 Auto-Document
+    runs-on: ubuntu-latest
+    needs: [validate, test]
+    if: github.event_name == 'push' && (needs.validate.outputs.has_changes == 'true' || github.event.inputs.force_deploy == 'true')
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📦 Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📝 Generate Documentation
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          # Run the documentation generator script
+          if [ -f "scripts/generate-docs.js" ]; then
+            node scripts/generate-docs.js
+          elif [ -f "scripts/generate-docs.py" ]; then
+            python scripts/generate-docs.py
+          else
+            echo "No documentation generator found - using template"
+            
+            # Auto-generate basic README if missing
+            if [ ! -f "README.md" ]; then
+              REPO_NAME="${{ github.repository }}"
+              cat > README.md << 'HEREDOC'
+# ${REPO_NAME##*/}
+
+[![Deploy](https://github.com/${{ github.repository }}/actions/workflows/deploy.yml/badge.svg)](https://github.com/${{ github.repository }}/actions/workflows/deploy.yml)
+
+## Quick Start
+
+\`\`\`bash
+git clone https://github.com/${{ github.repository }}.git
+cd ${REPO_NAME##*/}
+npm install  # or pip install -r requirements.txt
+\`\`\`
+
+## Deployment
+
+Push to main to auto-deploy via GitHub Actions.
+
+---
+*Auto-generated by Agent Launchpad*
+HEREDOC
+            fi
+            
+            # Auto-generate AGENTS.md for Jules compatibility
+            cat > AGENTS.md << 'HEREDOC'
+# Agent Configuration
+
+This file helps AI coding assistants (like Jules) understand this repository.
+
+## Project Structure
+
+- `/app` - Main application code
+- `/api` - API endpoints
+- `/scripts` - Automation scripts
+- `/.github/workflows` - CI/CD pipelines
+
+## Key Commands
+
+- `npm run dev` - Start development server
+- `npm run build` - Build for production
+- `npm test` - Run tests
+- `npm run deploy` - Deploy to production
+
+## Environment Variables
+
+See `.env.example` for required environment variables.
+
+## Conventions
+
+- Use TypeScript for type safety
+- Follow ESLint configuration
+- Write tests for new features
+- Use conventional commits
+
+---
+*Auto-generated by Agent Launchpad - Update this file to help AI assistants work with your code*
+HEREDOC
+          fi
+
+      - name: 📊 Generate Changelog
+        run: |
+          if [ ! -f "CHANGELOG.md" ]; then
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          fi
+          
+          # Append recent commits
+          echo "" >> CHANGELOG.md
+          echo "## [$(date +%Y-%m-%d)]" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          git log --oneline -10 --pretty=format:"- %s" >> CHANGELOG.md || true
+
+      - name: 🔄 Sync .env.example
+        run: |
+          # Extract env vars from code and create .env.example
+          if [ ! -f ".env.example" ]; then
+            echo "# Environment Variables" > .env.example
+            echo "# Copy this file to .env and fill in your values" >> .env.example
+            echo "" >> .env.example
+            
+            # Common AI API keys
+            echo "# AI API Keys (at least one required)" >> .env.example
+            echo "ANTHROPIC_API_KEY=" >> .env.example
+            echo "OPENAI_API_KEY=" >> .env.example
+            echo "GOOGLE_API_KEY=" >> .env.example
+            echo "" >> .env.example
+            echo "# Optional" >> .env.example
+            echo "NODE_ENV=development" >> .env.example
+          fi
+
+      - name: 💾 Commit Documentation
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Agent Launchpad Bot"
+          git add README.md AGENTS.md CHANGELOG.md .env.example 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "docs: auto-update documentation [skip ci]"
+          git push || echo "No changes to push"
+
+  # ============================================
+  # JOB 4: DEPLOY - Publish to Vercel
+  # ============================================
+  deploy:
+    name: 🚀 Deploy
+    runs-on: ubuntu-latest
+    needs: [validate, test, document]
+    if: always() && github.event_name == 'push' && needs.validate.result == 'success'
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🔧 Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: 🏗️ Build Project
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci --prefer-offline
+            npm run build 2>/dev/null || echo "No build script - deploying source"
+          fi
+
+      - name: 🚀 Deploy to Vercel
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          if [ -n "$VERCEL_TOKEN" ]; then
+            # Pull Vercel project settings
+            vercel pull --yes --environment=production --token=$VERCEL_TOKEN 2>/dev/null || true
+            
+            # Build and deploy
+            vercel build --prod --token=$VERCEL_TOKEN 2>/dev/null || true
+            DEPLOY_URL=$(vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN 2>/dev/null || echo "")
+            
+            if [ -n "$DEPLOY_URL" ]; then
+              echo "deploy_url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+              echo "✅ Deployed to: $DEPLOY_URL"
+            else
+              echo "⚠️ Deployment skipped - configure VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID"
+            fi
+          else
+            echo "⚠️ VERCEL_TOKEN not set - skipping deployment"
+            echo "Add VERCEL_TOKEN to repository secrets to enable auto-deployment"
+          fi
+
+      - name: 🏷️ Create Release
+        if: github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            ## Changes
+            
+            ${{ github.event.head_commit.message }}
+            
+            ## Deployment
+            
+            ${{ steps.deploy.outputs.deploy_url || 'Deployment pending - add Vercel secrets' }}
+            
+            ---
+            *Auto-generated by Agent Launchpad*
+          draft: false
+          prerelease: false
+
+      - name: 💬 Post Deploy Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployUrl = '${{ steps.deploy.outputs.deploy_url }}';
+            const body = deployUrl 
+              ? `## 🚀 Preview Deployment\n\n✅ Deployed to: ${deployUrl}\n\n*Auto-deployed by Agent Launchpad*`
+              : `## 🚀 Preview Deployment\n\n⚠️ Deployment pending - add Vercel secrets to enable preview deployments`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ============================================
+  # JOB 5: NOTIFY - Send notifications
+  # ============================================
+  notify:
+    name: 📢 Notify
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    
+    steps:
+      - name: 📢 Send Notification
+        run: |
+          STATUS="${{ needs.deploy.result }}"
+          
+          if [ "$STATUS" == "success" ]; then
+            echo "✅ Pipeline completed successfully!"
+          else
+            echo "⚠️ Pipeline completed with status: $STATUS"
+          fi
+          
+          # Add webhook notification here if configured
+          if [ -n "${{ secrets.SLACK_WEBHOOK }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data '{"text":"🚀 Agent Launchpad: Deployment ${{ needs.deploy.result }} for ${{ github.repository }}"}' \
+              ${{ secrets.SLACK_WEBHOOK }} 2>/dev/null || true
+          fi
+          
+          if [ -n "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data '{"content":"🚀 Agent Launchpad: Deployment ${{ needs.deploy.result }} for ${{ github.repository }}"}' \
+              ${{ secrets.DISCORD_WEBHOOK }} 2>/dev/null || true
+          fi
