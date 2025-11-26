@@ -286,6 +286,18 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
+## 🚀 Predeploy Validation
+
+Before pushing to Vercel, run:
+
+```bash
+bash ./predeploy-check.sh
+```
+
+This ensures lockfile presence and Node compatibility.
+
+---
+
 ## 🙏 Acknowledgments
 
 - Built with [Next.js](https://nextjs.org/)
